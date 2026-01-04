@@ -63,6 +63,7 @@ class MokioMindConfig(PretrainedConfig):
         self.aux_loss_alpha=aux_loss_alpha
         self.scoring_func=scoring_func
 
+        #Yarn RoPE scaling parameters
         self.rope_scaling = (
             {
                 "beta_fast": 4,
@@ -98,6 +99,7 @@ def precompute_freqs(
 ):
     freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)) # base^{2i/d}
 
+    # YARN缩放：用于外推到更长序列
     if rope_scaling is not None:
         original_max, factor, beta_fast, beta_slow = (
             rope_scaling.get("original_max_position_embeddings", 2048),
@@ -116,12 +118,16 @@ def precompute_freqs(
                 dim // 2 - 1, 1
             )
 
+
+            #线性插值计算
             beta = beta_slow + (beta_fast - beta_slow) * power
 
+            # YaRN缩放公式：λ = (β·α - β + 1)/(β·α)
+            # torch.where(): 条件选择，相当于 condition ? value1 : value2
             scale = torch.where(
-                torch.arange(dim // 2, device=freqs.device) < corr_dim,
-                (beta * factor - beta + 1) / (beta * factor),
-                1.0 / factor,
+                torch.arange(dim // 2, device=freqs.device) < corr_dim, 
+                (beta * factor - beta + 1) / (beta * factor),  # 高频部分使用复杂缩放
+                1.0 / factor                                    # 低频部分简单缩放
             )
 
             freqs = freqs * scale
@@ -327,3 +333,31 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # [bsz, seq_len, hidden]
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
+    
+
+    
+class FeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        # SwiGLU类似于Gated Linear Unit变体：act(gate(x)) * up(x)
+        # gate_proj: hidden -> intermediate (用于计算gate部分)
+        # up_proj: hidden -> intermediate (用于被gate的部分)
+        # down_proj: intermediate -> hidden (用于投影回hidden维度)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        # ACT2FN是transformers里激活函数的映射表，支持'silu','gelu'等
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        """
+        forward实现使用SwiGLU风格的门控激活：
+        output = down_proj( act_fn(gate_proj(x)) * up_proj(x) )
+        并在输出前应用dropout
+        """
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
