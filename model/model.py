@@ -5,8 +5,8 @@ import math
 from typing import Optional, Tuple,List,Union
 import torch.nn.functional as F
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class MiniMindConfig(PretrainedConfig):
+    model_type = "minimind"
 
     def __init__(
         self,
@@ -335,7 +335,7 @@ class Attention(nn.Module):
         return output, past_kv
     
 
-    
+
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -361,3 +361,111 @@ class FeedForward(nn.Module):
         """
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
+    
+
+    
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attn = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # 残差连接模式：先做LayerNorm -> Attention -> 残差相加 -> LayerNorm -> FFN -> 残差相加
+        # 保存残差以供后续相加
+        residual = hidden_states
+
+        # 注意力子层：输入先归一化（RMSNorm），返回hidden_states和present_key_value（用于cache）
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),  # pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+
+        # 注意力输出与残差相加
+        hidden_states = hidden_states + residual
+
+        # 前馈子层（post-attention layernorm）并相加
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
+                                                    end=config.max_position_embeddings, rope_base=config.rope_theta,
+                                                    rope_scaling=config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                **kwargs):
+        # input_ids: [bsz, seq_len]
+        batch_size, seq_length = input_ids.shape
+
+        # 兼容性检查：某些框架会传入包含.layers属性的对象，视为不携带past信息
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+
+        # past_key_values为每层的(past_k, past_v)列表，如果为None则创建与层数相同的None列表
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        # past_key_values[0] 形如 (k, v)，k.shape = [bsz, past_seq_len, n_kv_heads, head_dim]
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # Embedding + dropout
+        hidden_states = self.dropout(self.embed_tokens(input_ids))  # [bsz, seq_len, hidden]
+
+        # 从注册的buffer中取出对应位置范围的cos/sin作为position_embeddings
+        # self.freqs_cos/freqs_sin的shape为 [max_pos, head_dim]
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_length],
+            self.freqs_sin[start_pos:start_pos + seq_length]
+        )
+
+        # 逐层前向，通过zip把layer和对应的past_key_value配对
+        #present用于缓存当前层的key/value
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            #layer就是MiniMindBlock实例
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+
+        # 最后做归一化
+        hidden_states = self.norm(hidden_states)
+
+        # 如果使用MoE，收集每层的aux_loss并求和返回以便训练使用
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MOEFeedForward)
+        )
+
+        return hidden_states, presents, aux_loss
