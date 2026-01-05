@@ -1,9 +1,11 @@
-from transformers import PretrainedConfig
 import torch
-import torch.nn as nn
 import math
+import torch.nn as nn
 from typing import Optional, Tuple,List,Union
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -469,3 +471,44 @@ class MiniMindModel(nn.Module):
         )
 
         return hidden_states, presents, aux_loss
+    
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self, config: MiniMindConfig = None):
+        self.config = config or MiniMindConfig()
+        super().__init__(self.config)
+        self.model = MiniMindModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **args):
+        h, past_kvs, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        # logits_to_keep用于在序列末尾保留一部分logits（用于截断或微调策略）
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        # 通过lm_head将hidden states投影到词表logits
+        # h: [bsz, seq_len, hidden]
+        logits = self.lm_head(h[:, slice_indices, :])
+
+        # 使用PretrainedModel约定的输出容器CausalLMOutputWithPast
+        # 通过__setitem__方式填充键值，保持与Hugging Face接口兼容
+        self.OUT.__setitem__('last_hidden_state', h)
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('aux_loss', aux_loss)
+        self.OUT.__setitem__('past_key_values', past_kvs)
+        return self.OUT
+   
